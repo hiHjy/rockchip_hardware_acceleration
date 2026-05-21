@@ -1,4 +1,4 @@
-#include "rkmpp_dec.h"
+#include "mpp_simple.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <drm/drm.h>
@@ -9,6 +9,12 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#include "mpp_meta.h"
+
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+#define RKMPP_ALIGN(value, align) (((value) + (align) - 1) & ~((align) - 1))
 
 /*
  * 这是一个“尽量容易看懂”的单线程 MPP 解码示例。
@@ -256,7 +262,9 @@ int rk_mpp_decoder_init(RkMppDecoder *dec, MppCodingType type, FILE *f_out)
 
     if (!dec)
         return -1;
-
+    // if (dec->dec_initialized) {
+    //     return 0;
+    // }
     memset(dec, 0, sizeof(*dec));
     dec->f_out = f_out;
     dec->type = type;
@@ -298,7 +306,7 @@ int rk_mpp_decoder_init(RkMppDecoder *dec, MppCodingType type, FILE *f_out)
         printf("MPP_DEC_SET_CFG error\n");
         goto fail;
     }
-
+    dec->dec_initialized = 1;
     return 0;
 
 fail:
@@ -644,4 +652,355 @@ void rk_mpp_decoder_deinit(RkMppDecoder *dec)
     if (dec->frm_grp)
         mpp_buffer_group_put(dec->frm_grp);
     rk_mpp_decoder_release_ext_dma_fds(dec);
+}
+
+static void rk_mpp_encoder_calc_buffer_size(RkMppEncoder *enc)
+{
+    switch (enc->fmt) {
+    case MPP_FMT_YUV420SP:
+    case MPP_FMT_YUV420SP_VU:
+    case MPP_FMT_YUV420P:
+        enc->frame_size = (size_t)enc->h_stride * enc->v_stride * 3 / 2;
+        break;
+    case MPP_FMT_YUV422_YUYV:
+    case MPP_FMT_YUV422_YVYU:
+    case MPP_FMT_YUV422_UYVY:
+    case MPP_FMT_YUV422_VYUY:
+        enc->frame_size = (size_t)enc->h_stride * enc->v_stride * 2;
+        break;
+    case MPP_FMT_RGB888:
+    case MPP_FMT_BGR888:
+        enc->frame_size = (size_t)enc->h_stride * enc->v_stride * 3;
+        break;
+    case MPP_FMT_RGBA8888:
+    case MPP_FMT_BGRA8888:
+    case MPP_FMT_ARGB8888:
+    case MPP_FMT_ABGR8888:
+        enc->frame_size = (size_t)enc->h_stride * enc->v_stride * 4;
+        break;
+    default:
+        enc->frame_size = (size_t)enc->h_stride * enc->v_stride * 3 / 2;
+        break;
+    }
+    enc->packet_size = enc->frame_size;
+}
+
+static int rk_mpp_encoder_emit_packet(RkMppEncoder *enc,
+                                      MppPacket packet,
+                                      int is_header)
+{
+    const uint8_t *data = NULL;
+    size_t size = 0;
+    int eos = 0;
+
+    if (!enc || !packet)
+        return -1;
+
+    data = (const uint8_t *)mpp_packet_get_pos(packet);
+    size = mpp_packet_get_length(packet);
+    eos = mpp_packet_get_eos(packet);
+
+    if (size > 0 && enc->f_out)
+        fwrite(data, 1, size, enc->f_out);
+
+    if (is_header) {
+        printf("encoded header size=%zu\n", size);
+    } else {
+        enc->pkt_eos = eos;
+        enc->frame_count++;
+        printf("encoded frame %d, packet size=%zu eos=%d\n",
+               enc->frame_count, size, eos);
+    }
+
+    if (size > 0 && enc->packet_callback)
+        enc->packet_callback(data, size, is_header, eos,
+                             enc->packet_callback_userdata);
+
+    return 0;
+}
+
+static int rk_mpp_encoder_prepare(RkMppEncoder *enc)
+{
+    MPP_RET ret = MPP_OK;
+    MppEncHeaderMode header_mode = MPP_ENC_HEADER_MODE_EACH_IDR;
+
+    ret = mpp_create(&enc->ctx, &enc->mpi);
+    if (ret) {
+        printf("mpp_create encoder failed ret=%d\n", ret);
+        return -1;
+    }
+
+    ret = mpp_init(enc->ctx, MPP_CTX_ENC, enc->type);
+    if (ret) {
+        printf("mpp_init encoder failed ret=%d\n", ret);
+        return -1;
+    }
+
+    ret = mpp_enc_cfg_init(&enc->enc_cfg);
+    if (ret) {
+        printf("mpp_enc_cfg_init failed ret=%d\n", ret);
+        return -1;
+    }
+
+    ret = enc->mpi->control(enc->ctx, MPP_ENC_GET_CFG, enc->enc_cfg);
+    if (ret) {
+        printf("MPP_ENC_GET_CFG failed ret=%d\n", ret);
+        return -1;
+    }
+
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "prep:width", enc->width);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "prep:height", enc->height);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "prep:hor_stride", enc->h_stride);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "prep:ver_stride", enc->v_stride);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "prep:format", enc->fmt);
+
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:mode", MPP_ENC_RC_MODE_CBR);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:fps_in_flex", 0);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:fps_in_num", enc->fps);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:fps_in_denorm", 1);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:fps_out_flex", 0);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:fps_out_num", enc->fps);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:fps_out_denorm", 1);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:gop", enc->gop);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:bps_target", enc->bps);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:bps_max", enc->bps * 17 / 16);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:bps_min", enc->bps * 15 / 16);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_init", -1);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_max", 48);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_min", 10);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_max_i", 48);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_min_i", 10);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_ip", 2);
+
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "codec:type", enc->type);
+    if (enc->type == MPP_VIDEO_CodingAVC) {
+        mpp_enc_cfg_set_s32(enc->enc_cfg, "h264:profile", 100);
+        mpp_enc_cfg_set_s32(enc->enc_cfg, "h264:level", 40);
+        mpp_enc_cfg_set_s32(enc->enc_cfg, "h264:cabac_en", 1);
+        mpp_enc_cfg_set_s32(enc->enc_cfg, "h264:trans8x8", 1);
+    }
+
+    ret = enc->mpi->control(enc->ctx, MPP_ENC_SET_CFG, enc->enc_cfg);
+    if (ret) {
+        printf("MPP_ENC_SET_CFG failed ret=%d\n", ret);
+        return -1;
+    }
+
+    if (enc->type == MPP_VIDEO_CodingAVC) {
+        ret = enc->mpi->control(enc->ctx, MPP_ENC_SET_HEADER_MODE,
+                                &header_mode);
+        if (ret) {
+            printf("MPP_ENC_SET_HEADER_MODE failed ret=%d\n", ret);
+            return -1;
+        }
+    }
+
+    ret = mpp_buffer_group_get_internal(&enc->buf_grp, MPP_BUFFER_TYPE_DRM);
+    if (ret) {
+        printf("mpp_buffer_group_get_internal failed ret=%d\n", ret);
+        return -1;
+    }
+
+    ret = mpp_buffer_get(enc->buf_grp, &enc->frm_buf, enc->frame_size);
+    if (ret) {
+        printf("mpp_buffer_get frm_buf failed ret=%d\n", ret);
+        return -1;
+    }
+
+    ret = mpp_buffer_get(enc->buf_grp, &enc->pkt_buf, enc->packet_size);
+    if (ret) {
+        printf("mpp_buffer_get pkt_buf failed ret=%d\n", ret);
+        return -1;
+    }
+
+    return 0;
+}
+
+int rk_mpp_encoder_init(RkMppEncoder *enc,
+                        MppCodingType type,
+                        RK_U32 width,
+                        RK_U32 height,
+                        RK_U32 h_stride,
+                        RK_U32 v_stride,
+                        MppFrameFormat fmt,
+                        RK_S32 fps,
+                        RK_S32 bps,
+                        RK_S32 gop,
+                        FILE *f_out)
+{
+    if (!enc || !width || !height) {
+        printf("rk_mpp_encoder_init invalid argument\n");
+        return -1;
+    }
+
+    memset(enc, 0, sizeof(*enc));
+
+    enc->type = type;
+    enc->width = width;
+    enc->height = height;
+    enc->h_stride = h_stride ? h_stride : RKMPP_ALIGN(width, 16);
+    enc->v_stride = v_stride ? v_stride : RKMPP_ALIGN(height, 16);
+    enc->fmt = fmt;
+    enc->fps = fps > 0 ? fps : 30;
+    enc->bps = bps > 0 ? bps : (RK_S32)(width * height * enc->fps / 8);
+    enc->gop = gop > 0 ? gop : enc->fps;
+    enc->f_out = f_out;
+
+    rk_mpp_encoder_calc_buffer_size(enc);
+    if (rk_mpp_encoder_prepare(enc)) {
+        rk_mpp_encoder_deinit(enc);
+        return -1;
+    }
+
+    return 0;
+}
+
+void rk_mpp_encoder_set_packet_callback(RkMppEncoder *enc,
+                                        RkMppPacketCallback callback,
+                                        void *userdata)
+{
+    if (!enc)
+        return;
+
+    enc->packet_callback = callback;
+    enc->packet_callback_userdata = userdata;
+}
+
+int rk_mpp_encoder_write_header(RkMppEncoder *enc)
+{
+    MPP_RET ret = MPP_OK;
+
+    if (!enc || !enc->ctx || !enc->mpi || !enc->pkt_buf) {
+        printf("rk_mpp_encoder_write_header invalid encoder state\n");
+        return -1;
+    }
+
+    ret = mpp_packet_init_with_buffer(&enc->packet, enc->pkt_buf);
+    if (ret) {
+        printf("mpp_packet_init_with_buffer failed ret=%d\n", ret);
+        return -1;
+    }
+
+    mpp_packet_set_length(enc->packet, 0);
+
+    ret = enc->mpi->control(enc->ctx, MPP_ENC_GET_HDR_SYNC, enc->packet);
+    if (ret) {
+        printf("MPP_ENC_GET_HDR_SYNC failed ret=%d\n", ret);
+        mpp_packet_deinit(&enc->packet);
+        return -1;
+    }
+
+    rk_mpp_encoder_emit_packet(enc, enc->packet, 1);
+    mpp_packet_deinit(&enc->packet);
+    return 0;
+}
+
+int rk_mpp_encoder_send_frame(RkMppEncoder *enc, int fd, int eos)
+{
+    MPP_RET ret = MPP_OK;
+    MppMeta meta = NULL;
+    MppBuffer frm_buf = NULL;
+    MppBufferInfo info = {0};
+
+    if (!enc || !enc->ctx || !enc->mpi) {
+        printf("invalid encoder state\n");
+        return -1;
+    }
+
+    if (fd < 0) {
+        printf("rk_mpp_encoder_send_frame invalid fd=%d\n", fd);
+        return -1;
+    }
+
+    info.type = MPP_BUFFER_TYPE_EXT_DMA;
+    info.fd = fd;
+    info.size = enc->frame_size;
+
+    ret = mpp_buffer_import(&frm_buf, &info);
+    if (ret || !frm_buf) {
+        printf("mpp_buffer_import failed ret=%d\n", ret);
+        return -1;
+    }
+
+    ret = mpp_frame_init(&enc->frame);
+    if (ret) {
+        printf("mpp_frame_init failed ret=%d\n", ret);
+        mpp_buffer_put(frm_buf);
+        return -1;
+    }
+
+    mpp_frame_set_width(enc->frame, enc->width);
+    mpp_frame_set_height(enc->frame, enc->height);
+    mpp_frame_set_hor_stride(enc->frame, enc->h_stride);
+    mpp_frame_set_ver_stride(enc->frame, enc->v_stride);
+    mpp_frame_set_fmt(enc->frame, enc->fmt);
+    mpp_frame_set_eos(enc->frame, eos ? 1 : 0);
+    mpp_frame_set_buffer(enc->frame, frm_buf);
+
+    meta = mpp_frame_get_meta(enc->frame);
+
+    ret = mpp_packet_init_with_buffer(&enc->packet, enc->pkt_buf);
+    if (ret) {
+        printf("mpp_packet_init_with_buffer failed ret=%d\n", ret);
+        mpp_frame_deinit(&enc->frame);
+        mpp_buffer_put(frm_buf);
+        return -1;
+    }
+
+    mpp_packet_set_length(enc->packet, 0);
+    mpp_meta_set_packet(meta, KEY_OUTPUT_PACKET, enc->packet);
+
+    ret = enc->mpi->encode_put_frame(enc->ctx, enc->frame);
+    if (ret) {
+        printf("encode_put_frame failed ret=%d\n", ret);
+        mpp_packet_deinit(&enc->packet);
+        mpp_frame_deinit(&enc->frame);
+        mpp_buffer_put(frm_buf);
+        return -1;
+    }
+
+    mpp_frame_deinit(&enc->frame);
+
+    ret = enc->mpi->encode_get_packet(enc->ctx, &enc->packet);
+    if (ret) {
+        printf("encode_get_packet failed ret=%d\n", ret);
+        mpp_packet_deinit(&enc->packet);
+        mpp_buffer_put(frm_buf);
+        return -1;
+    }
+
+    if (enc->packet) {
+        rk_mpp_encoder_emit_packet(enc, enc->packet, 0);
+        mpp_packet_deinit(&enc->packet);
+    }
+
+    mpp_buffer_put(frm_buf);
+
+    if (eos)
+        enc->eos_sent = 1;
+
+    return 0;
+}
+
+void rk_mpp_encoder_deinit(RkMppEncoder *enc)
+{
+    if (!enc)
+        return;
+
+    if (enc->packet)
+        mpp_packet_deinit(&enc->packet);
+    if (enc->frame)
+        mpp_frame_deinit(&enc->frame);
+    if (enc->enc_cfg)
+        mpp_enc_cfg_deinit(enc->enc_cfg);
+    if (enc->frm_buf)
+        mpp_buffer_put(enc->frm_buf);
+    if (enc->pkt_buf)
+        mpp_buffer_put(enc->pkt_buf);
+    if (enc->buf_grp)
+        mpp_buffer_group_put(enc->buf_grp);
+    if (enc->ctx)
+        mpp_destroy(enc->ctx);
+
+    memset(enc, 0, sizeof(*enc));
 }
